@@ -1,0 +1,12 @@
+--- a/drivers/misc/mediatek/base/power/drcc_v1/mt6768/mtk_drcc.c
++++ b/drivers/misc/mediatek/base/power/drcc_v1/mt6768/mtk_drcc.c
+@@ -1390,6 +1390,9 @@
+ {
+ 	int err = 0;
+ 
++	/* pmOS: skip DRCC, it hangs on lancelot; only a CPU voltage optimisation */
++	return 0;
++
+ 	/* init timer for log */
+ 	hrtimer_init(&drcc_timer_log, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	drcc_timer_log.function = drcc_timer_log_func;

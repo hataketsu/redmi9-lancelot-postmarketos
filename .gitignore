@@ -1,0 +1,10 @@
+# KHONG BAO GIO commit khoa rieng
+adbkey
+adbkey.pub
+*.pem
+*.key
+
+# anh nhi phan lon
+*.img
+*.img.gz
+*.zip

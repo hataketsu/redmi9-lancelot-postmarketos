@@ -1,0 +1,33 @@
+--- a/drivers/power/supply/mediatek/charger/smb1351-charger.c
++++ b/drivers/power/supply/mediatek/charger/smb1351-charger.c
+@@ -1323,9 +1323,13 @@
+ {
+ 	struct smb1351_charger *chip = container_of(work,
+ 			struct smb1351_charger, float_chg_det_work.work);
+-	struct charger_manager *cm = chip->chg_consumer->cm;
++	struct charger_manager *cm = chip->chg_consumer ?
++			chip->chg_consumer->cm : NULL;
+ 	union power_supply_propval val;
+ 
++	if (!cm)
++		return;
++
+ 	power_supply_get_property(chip->usb_psy,
+ 			POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
+ 	if (cm->usb_state != 2 && usb_det_flag == 0) {
+@@ -2614,10 +2618,14 @@
+ static int smb1351_check_hv_charging(struct charger_device *chg_dev)
+ {
+ 	struct smb1351_charger *chip = dev_get_drvdata(&chg_dev->dev);
+-	struct charger_manager *cm = chip->chg_consumer->cm;
++	struct charger_manager *cm = chip->chg_consumer ?
++			chip->chg_consumer->cm : NULL;
+ 	int rc = 0;
+ 	static bool pre_hv_charging_status = true;
+ 
++	if (!cm)
++		return 0;
++
+ 
+ 	if (pre_hv_charging_status != cm->enable_hv_charging) {
+ 		pr_info("%s: hv charging is %s, pre_status is %d\n", __func__,
