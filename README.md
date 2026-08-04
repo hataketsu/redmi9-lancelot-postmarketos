@@ -15,18 +15,25 @@ flash_offset_dtb  0x0bc08000   tags   0x0bc08000   second  0xbff88000
 pagesize 2048   header_version 2
 ```
 
-Status: **working.** postmarketOS boots from a microSD card with OpenRC, the panel and
-framebuffer console come up, and SSH over USB works. The worn-out eMMC holds only the
-small read-only `boot` partition.
+Status: **usable as a standalone device.** postmarketOS boots from a microSD card with
+OpenRC. Display, ten-finger touch, WiFi and SSH all work, and there is a terminal with
+an on-screen keyboard on the panel. The worn-out eMMC holds only the small read-only
+boot image.
 
 ```
 PRETTY_NAME  postmarketOS edge
 kernel       4.14.320 #1-postmarketOS aarch64
 init         OpenRC
 rootfs       /dev/mmcblk1p2   28.3G on /
-network      SSH at 172.16.42.1 over USB RNDIS
-display      fb0 1088x7104, fbcon bound, KTD3137 backlight
+display      fb0 1088x7104 RGBA, KTD3137 backlight
+touch        Novatek NT36672, 10 finger, protocol B
+wifi         wlan0, WPA2, MT6768 CONNAC
+network      SSH at 172.16.42.1 over USB RNDIS, plus WiFi
+console      userspace framebuffer terminal + on-screen keyboard
 ```
+
+`fbcon` is *not* usable — see blocker 5c. The terminal on the panel is
+[`scripts/fbterm`](scripts/fbterm), which draws to `/dev/fb0` directly.
 
 ---
 
