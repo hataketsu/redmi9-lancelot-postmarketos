@@ -43,3 +43,15 @@ if [ "${2:-}" = "--now" ]; then
   # busybox `reboot` o day tat han may; sysrq 'b' reset that su.
   $SSH "echo $PASS | sudo -S sh -c 'sync; echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger'" || true
 fi
+
+# ---------------------------------------------------------------------------
+# Neu BCB dang rong thi may boot vao LineageOS, luc do script nay khong dung
+# duoc nua (no can pmOS dang chay de SSH vao). Quay lai pmOS tu LineageOS:
+#
+#   adb root
+#   adb shell 'printf "%-32s" boot-recovery | tr " " "\0" \
+#       | dd of=/dev/block/by-name/misc conv=notrunc'
+#   adb reboot
+#
+# Hoac don gian: adb reboot recovery
+# ---------------------------------------------------------------------------
