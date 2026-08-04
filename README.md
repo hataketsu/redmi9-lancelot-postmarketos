@@ -15,8 +15,18 @@ flash_offset_dtb  0x0bc08000   tags   0x0bc08000   second  0xbff88000
 pagesize 2048   header_version 2
 ```
 
-Status: **kernel boots, display lights up, SD card is detected, initramfs mounts
-the rootfs and `switch_root` succeeds.** systemd then freezes; see below.
+Status: **working.** postmarketOS boots from a microSD card with OpenRC, the panel and
+framebuffer console come up, and SSH over USB works. The worn-out eMMC holds only the
+small read-only `boot` partition.
+
+```
+PRETTY_NAME  postmarketOS edge
+kernel       4.14.320 #1-postmarketOS aarch64
+init         OpenRC
+rootfs       /dev/mmcblk1p2   28.3G on /
+network      SSH at 172.16.42.1 over USB RNDIS
+display      fb0 1088x7104, fbcon bound, KTD3137 backlight
+```
 
 ---
 
@@ -96,6 +106,51 @@ string is musl's `strerror` for the resulting errno.
 
 **Conclusion: modern systemd cannot run on this kernel. Use OpenRC**
 (`pmbootstrap config service_manager openrc`).
+
+### 5. Black screen — three separate causes stacked
+
+Once the system booted, the panel stayed dark. Three independent problems, each hiding
+the next:
+
+**a. `/dev/fb0` reported size `0,0`.** The kernel was built with merlin's config, whose
+`CONFIG_CUSTOM_KERNEL_LCM` lists Redmi Note 9 panels. lancelot's panels carry a `_j19`
+suffix, so no driver matched the `LCM_name=` that LK passes on the cmdline:
+
+```
+kernel had (merlin):  nt36672A_fhdp_dsi_vdo_tianma
+device reports:       nt36672A_fhdp_dsi_vdo_tianma_j19_lcm_drv
+```
+
+Fix — use lancelot's list:
+
+```
+CONFIG_CUSTOM_KERNEL_LCM="nt36672A_fhdp_dsi_vdo_tianma_j19 ft8719_fhdp_dsi_vdo_huaxing_j19 nt36672A_fhdp_dsi_vdo_dijing_j19 nt36672D_fhdp_dsi_vdo_dijing_j19"
+```
+
+After this `fb0` came up as `1088,7104` — matching LineageOS — and the KTD3137 backlight
+driver appeared.
+
+**b. Backlight defaults to 0, and is not where you expect it.** It lives under
+`/sys/class/leds/lcd-backlight`, **not** `/sys/class/backlight/`, so ordinary brightness
+tools never see it. Range is 0–2047 and it boots at 0, so the panel is alive but black.
+Persist it with `/etc/local.d/backlight.start` (the `local` service is already in the
+`default` runlevel).
+
+**c. `CONFIG_FRAMEBUFFER_CONSOLE` was not set.** Everything *looked* right — `/dev/fb0`
+writable at 74 MB/s, backlight on, `getty` running on tty1 — yet text written to
+`/dev/tty1` never appeared. The giveaway is the vtconsole binding:
+
+```
+before:  vtcon0 -> (S) dummy device        bind=1     # only the dummy
+after:   vtcon0 -> (S) dummy device        bind=0
+         vtcon1 -> (M) frame buffer device bind=1     # fbcon attached
+```
+
+Enable `CONFIG_FRAMEBUFFER_CONSOLE=y` and `CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y`.
+`CONFIG_FONT_TER16x32=y` plus `fbcon=font:TER16x32` on the cmdline makes the console
+legible on a 1080x2340 panel — the default 8x16 font is pinhead-sized.
+
+Result: the Tux boot logos render (one per CPU core) and the login prompt is usable.
 
 ---
 
