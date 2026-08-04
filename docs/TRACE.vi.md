@@ -996,3 +996,72 @@ Gói sẵn trong `wifi-up.sh`, tự chạy lúc khởi động qua `/etc/local.d
 
 MAC là ngẫu nhiên (`5a:ca:...`, locally administered) vì chưa đọc từ phân vùng `nvram`.
 Không cản trở sử dụng.
+
+## 21. U-Boot: dựng xong ảnh, kèm kênh log tự đọc
+
+Trạng thái: **build sạch, đóng gói xong, chưa nạp.** Lý do chưa nạp ở mục 21.4.
+
+### 21.1 Ba lỗi link khi thêm driver mới
+
+- `common.h: No such file or directory` — U-Boot mới đã bỏ `common.h`;
+  thay bằng `<errno.h>` + `<linux/types.h>`.
+- `multiple definition of board_late_init` — `arch/arm/mach-mediatek/mt6768/init.c`
+  đã có sẵn; bản trong `board/mediatek/mt6768/mt6768.c` phải bỏ.
+- `multiple definition of printch/printascii/...` — `serial_mtk.c` cũng khai báo
+  `DEBUG_UART_FUNCS`. Tắt `CONFIG_MTK_SERIAL` (không dùng UART thật).
+- `undefined reference to _u_boot_list_2_driver_2_mtk_pwrap` — `board_late_init`
+  gọi driver PMIC trong khi `CONFIG_POWER` tắt. Bọc `#ifdef CONFIG_POWER`.
+
+### 21.2 Console ghi vào RAM
+
+Máy không có UART nào với tới được mà không thao vỏ, nên U-Boot chết trước lúc lên
+hình là mất dấu hoàn toàn. Thêm `drivers/serial/serial_memlog.c`: một driver
+`UCLASS_SERIAL` ghi từng byte console vào RAM, kèm móc `DEBUG_UART` cho giai đoạn
+sớm nhất. `stdout-path` trỏ vào nó.
+
+**Chọn địa chỉ là chỗ dễ sai.** Ban đầu tôi lấy phần đuôi của vùng đặt trước cho
+framebuffer, tưởng là trống:
+
+```
+mblock-11-framebuffer  0x7dcb0000  size 0x2250000  (36 MB)
+/dev/fb0 anh xa        1088*7104*4               (30,9 MB)
+```
+
+Đọc thử `0x7fcb0000` thì ra `0xf800f800` — dữ liệu điểm ảnh. **LK vẽ logo lên đó**,
+nên nó sẽ xoá log ngay ở lần reset sau khi treo, tức đúng lúc cần đọc.
+
+Chuyển sang vùng console của ramoops. Xác minh tại chỗ bằng cách quét `/dev/mem`:
+
+```
+0x4d05f000  sig="DBGC"  start=0x36efe  data="[    0.00000..."
+```
+
+Dùng đúng định dạng `persistent_ram_buffer` của Linux (`sig`, `start`, `size`, rồi
+text; `start` và `size` phải bằng nhau), nên log của U-Boot **tự hiện ra ở
+`/sys/fs/pstore/console-ramoops`** ở lần boot kế tiếp, không cần công cụ gì.
+
+`read-uboot-log.py` đọc cả hai đường. Đường `/dev/mem` không dùng được
+(`EFAULT` — vùng reserved không nằm trong `iomem` nên `devmem_is_allowed` từ chối),
+nhưng đường pstore thì chạy.
+
+### 21.3 Đóng gói ảnh boot
+
+`pack-uboot-boot.py` **không tự đặt địa chỉ nạp**: lấy nguyên header của một
+`boot.img` đã biết chắc boot được, chỉ thay phần kernel. Nhờ vậy mọi offset
+(kernel/ramdisk/tags/dtb) giống hệt bản gốc.
+
+```
+kernel 552504 B @ 0x40080000   magic ARM64 tai offset 56: "ARM\x64"
+ramdisk 9160252 B (giu nguyen - ramdisk_size = 0 la LK bao lk_crash)
+footer AVBf: co
+```
+
+### 21.4 Vì sao chưa nạp
+
+Nạp U-Boot vào `recovery` rồi đặt BCB `boot-recovery`: nếu U-Boot treo thì watchdog
+reset, LK đọc BCB **vẫn còn nguyên** (đã đo: BCB không tự xoá) nên lại nạp U-Boot →
+lặp vô hạn. Mà pmOS cũng nằm ở `recovery` nên mất luôn đường vào bằng SSH. Thoát ra
+phải bấm nút vào fastboot — đúng thứ cần tránh khi không có người cầm máy.
+
+Muốn tự phục hồi thì U-Boot phải ghi BCB rỗng **ngay khi vừa chạy**, việc này cần
+MMC đã init nên không thể đặt ở lệnh đầu tiên. Vẫn còn cửa sổ chết.
