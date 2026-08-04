@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+Framebuffer terminal with on-screen keyboard for the Redmi 9 (lancelot).
+
+Why this exists: the downstream mtkfb driver's fbcon paints the boot logo and
+then never renders text, on any font or cmdline combination. Writing pixels to
+/dev/fb0 works perfectly, so the terminal is drawn here instead.
+
+Framebuffer facts for this device:
+  - /dev/fb0 is RGBA, not BGRA
+  - virtual 1088x7104 = three 2368-line pages; the panel scans out page 0
+  - visible area is 1080x2340, stride 1088*4
+
+Input: the Novatek NT36672 touchscreen (needs /lib/firmware/nvt_tm_fw.bin from
+the stock vendor image), plus any evdev keyboard over USB OTG.
+
+The screen is split into two independently-refreshed bands so a keypress does
+not cost a full-frame redraw:
+    rows [0, TERM_H)        terminal
+    rows [TERM_H, VIS_H)    keyboard
+"""
+import os, pty, select, struct, sys, termios, fcntl, time
+import pyte
+from PIL import Image, ImageDraw, ImageFont
+
+W, VIS_H = 1088, 2340        # W is the stride width; visible is 1080
+KBD_ROWS = 5
+KEY_H = 132
+KBD_H = KBD_ROWS * KEY_H
+TERM_H = VIS_H - KBD_H
+
+FONT_SIZE = 26
+FG = (210, 210, 210)
+BG = (0, 0, 0)
+KEY_BG = (38, 38, 42)
+KEY_BG_MOD = (60, 60, 90)
+KEY_BG_HIT = (110, 110, 130)
+KEY_FG = (235, 235, 235)
+KEY_EDGE = (70, 70, 76)
+
+
+def load_font(size):
+    for p in ("/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"):
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+
+FONT = load_font(FONT_SIZE)
+KFONT = load_font(34)
+CW = FONT.getbbox("M")[2] or 15
+CH = FONT_SIZE + 4
+COLS = max(20, W // CW)
+ROWS = max(10, TERM_H // CH)
+
+screen = pyte.Screen(COLS, ROWS)
+stream = pyte.ByteStream(screen)
+fb = open("/dev/fb0", "r+b", buffering=0)
+
+# --- keyboard layout -------------------------------------------------------
+# Each key: (label, kind, payload, width in units). Unit = 1/10 of screen width.
+L = [
+    [("q", "c", "q", 1), ("w", "c", "w", 1), ("e", "c", "e", 1), ("r", "c", "r", 1),
+     ("t", "c", "t", 1), ("y", "c", "y", 1), ("u", "c", "u", 1), ("i", "c", "i", 1),
+     ("o", "c", "o", 1), ("p", "c", "p", 1)],
+    [("a", "c", "a", 1), ("s", "c", "s", 1), ("d", "c", "d", 1), ("f", "c", "f", 1),
+     ("g", "c", "g", 1), ("h", "c", "h", 1), ("j", "c", "j", 1), ("k", "c", "k", 1),
+     ("l", "c", "l", 1), ("-", "c", "-", 1)],
+    [("^", "m", "shift", 1.5), ("z", "c", "z", 1), ("x", "c", "x", 1), ("c", "c", "c", 1),
+     ("v", "c", "v", 1), ("b", "c", "b", 1), ("n", "c", "n", 1), ("m", "c", "m", 1),
+     ("<-", "k", "\x7f", 1.5)],
+    [("#", "m", "sym", 1.5), ("Tab", "k", "\t", 1.2), ("space", "c", " ", 4.1),
+     (".", "c", ".", 1), ("Ent", "k", "\r", 2.2)],
+    [("Esc", "k", "\x1b", 1.4), ("Ctl", "m", "ctrl", 1.4), ("/", "c", "/", 1),
+     ("|", "c", "|", 1), ("Up", "k", "\x1b[A", 1.4), ("Dn", "k", "\x1b[B", 1.4),
+     ("Lf", "k", "\x1b[D", 1.2), ("Rt", "k", "\x1b[C", 1.2)],
+]
+
+SYM = [
+    [("1", "c", "1", 1), ("2", "c", "2", 1), ("3", "c", "3", 1), ("4", "c", "4", 1),
+     ("5", "c", "5", 1), ("6", "c", "6", 1), ("7", "c", "7", 1), ("8", "c", "8", 1),
+     ("9", "c", "9", 1), ("0", "c", "0", 1)],
+    [("!", "c", "!", 1), ("@", "c", "@", 1), ("#", "c", "#", 1), ("$", "c", "$", 1),
+     ("%", "c", "%", 1), ("&", "c", "&", 1), ("*", "c", "*", 1), ("(", "c", "(", 1),
+     (")", "c", ")", 1), ("_", "c", "_", 1)],
+    [("~", "c", "~", 1.5), ("`", "c", "`", 1), ("'", "c", "'", 1), ('"', "c", '"', 1),
+     (":", "c", ":", 1), (";", "c", ";", 1), ("=", "c", "=", 1), ("+", "c", "+", 1),
+     ("<-", "k", "\x7f", 1.5)],
+    [("abc", "m", "sym", 1.5), ("Tab", "k", "\t", 1.2), ("space", "c", " ", 4.1),
+     (",", "c", ",", 1), ("Ent", "k", "\r", 2.2)],
+    [("Esc", "k", "\x1b", 1.4), ("Ctl", "m", "ctrl", 1.4), ("{", "c", "{", 1),
+     ("}", "c", "}", 1), ("[", "c", "[", 1), ("]", "c", "]", 1),
+     ("<", "c", "<", 1.2), (">", "c", ">", 1.2)],
+]
+
+UNIT = 1080 / 10.0
+mods = {"shift": False, "ctrl": False, "sym": False}
+hit_key = None          # (row, index) currently pressed, for highlighting
+
+
+def layout():
+    return SYM if mods["sym"] else L
+
+
+def key_rects():
+    """Yield (x0, y0, x1, y1, key, row, idx) in absolute screen coordinates."""
+    rows = layout()
+    for r, row in enumerate(rows):
+        x = 0.0
+        y0 = TERM_H + r * KEY_H
+        for i, k in enumerate(row):
+            w = k[3] * UNIT
+            yield int(x), y0, int(x + w) - 3, y0 + KEY_H - 3, k, r, i
+            x += w
+
+
+def render_kbd():
+    img = Image.new("RGB", (W, KBD_H), BG)
+    d = ImageDraw.Draw(img)
+    for x0, y0, x1, y1, k, r, i in key_rects():
+        label, kind, payload, _ = k
+        if kind == "m" and mods.get(payload):
+            bg = KEY_BG_MOD
+        elif hit_key == (r, i):
+            bg = KEY_BG_HIT
+        else:
+            bg = KEY_BG
+        ry0, ry1 = y0 - TERM_H, y1 - TERM_H
+        d.rectangle([x0, ry0, x1, ry1], fill=bg, outline=KEY_EDGE)
+        show = label.upper() if (mods["shift"] and kind == "c" and len(label) == 1) else label
+        bb = KFONT.getbbox(show)
+        d.text((x0 + ((x1 - x0) - (bb[2] - bb[0])) // 2,
+                ry0 + (KEY_H - (bb[3] - bb[1])) // 2 - bb[1]),
+               show, font=KFONT, fill=KEY_FG)
+    blit(img, TERM_H)
+
+
+def render_term():
+    img = Image.new("RGB", (W, TERM_H), BG)
+    d = ImageDraw.Draw(img)
+    for y, line in enumerate(screen.display):
+        if (y + 1) * CH > TERM_H:
+            break
+        d.text((2, y * CH), line, font=FONT, fill=FG)
+    cy, cx = screen.cursor.y, screen.cursor.x
+    if (cy + 1) * CH <= TERM_H:
+        d.rectangle([cx * CW, cy * CH, cx * CW + CW - 1, cy * CH + CH - 2], outline=FG)
+    blit(img, 0)
+
+
+def blit(img, y_off):
+    """Write an RGB image to /dev/fb0 at row y_off. The panel is RGBA."""
+    h = img.size[1]
+    px = img.tobytes()
+    out = bytearray(W * h * 4)
+    out[0::4] = px[0::3]
+    out[1::4] = px[1::3]
+    out[2::4] = px[2::3]
+    out[3::4] = b"\xff" * (W * h)
+    fb.seek(y_off * W * 4)
+    fb.write(bytes(out))
+
+
+def tap_to_bytes(x, y):
+    """Map a touch to key output. Returns (bytes, needs_kbd_redraw)."""
+    global hit_key
+    if y < TERM_H:
+        return b"", False
+    for x0, y0, x1, y1, k, r, i in key_rects():
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            label, kind, payload, _ = k
+            hit_key = (r, i)
+            if kind == "m":
+                mods[payload] = not mods[payload]
+                return b"", True
+            if kind == "k":
+                out = payload.encode()
+            else:
+                ch = payload.upper() if mods["shift"] else payload
+                if mods["ctrl"] and len(ch) == 1 and ch.isalpha():
+                    out = bytes([ord(ch.lower()) - 96])
+                else:
+                    out = ch.encode()
+            # shift and ctrl are one-shot
+            redraw = mods["shift"] or mods["ctrl"]
+            mods["shift"] = mods["ctrl"] = False
+            return out, True or redraw
+    return b"", False
+
+
+def open_touch():
+    try:
+        import evdev
+        for p in evdev.list_devices():
+            dev = evdev.InputDevice(p)
+            if "NVT" in dev.name or "ouch" in dev.name:
+                return dev
+    except Exception:
+        pass
+    return None
+
+
+def open_keyboards():
+    kbds = []
+    try:
+        import evdev
+        for p in evdev.list_devices():
+            dev = evdev.InputDevice(p)
+            if "NVT" in dev.name:
+                continue
+            caps = dev.capabilities()
+            if evdev.ecodes.EV_KEY in caps and len(caps[evdev.ecodes.EV_KEY]) > 40:
+                kbds.append(dev)
+    except Exception:
+        pass
+    return kbds
+
+
+def keymap(code):
+    import evdev
+    e = evdev.ecodes
+    simple = {e.KEY_ENTER: b"\r", e.KEY_BACKSPACE: b"\x7f", e.KEY_TAB: b"\t",
+              e.KEY_SPACE: b" ", e.KEY_ESC: b"\x1b"}
+    if code in simple:
+        return simple[code]
+    name = e.KEY[code] if code in e.KEY else ""
+    if isinstance(name, list):
+        name = name[0]
+    if name.startswith("KEY_") and len(name) == 5:
+        return name[4].lower().encode()
+    return b""
+
+
+def main():
+    global hit_key
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "linux"
+        os.environ["COLUMNS"] = str(COLS)
+        os.environ["LINES"] = str(ROWS)
+        os.execvp("/bin/login", ["/bin/login", "-f", "user"])
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+
+    import evdev
+    e = evdev.ecodes
+    touch = open_touch()
+    kbds = open_keyboards()
+
+    render_term()
+    render_kbd()
+
+    cur_slot = 0
+    sx, sy = {}, {}
+    new_touch = None
+    hit_until = 0.0
+    last_term = 0.0
+
+    while True:
+        rl = [fd] + [k.fd for k in kbds] + ([touch.fd] if touch else [])
+        r, _, _ = select.select(rl, [], [], 0.05)
+
+        if fd in r:
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            stream.feed(data)
+
+        for k in kbds:
+            if k.fd in r:
+                try:
+                    for ev in k.read():
+                        if ev.type == e.EV_KEY and ev.value == 1:
+                            ch = keymap(ev.code)
+                            if ch:
+                                os.write(fd, ch)
+                except Exception:
+                    pass
+
+        if touch and touch.fd in r:
+            try:
+                for ev in touch.read():
+                    if ev.type == e.EV_ABS:
+                        if ev.code == e.ABS_MT_SLOT:
+                            cur_slot = ev.value
+                        elif ev.code == e.ABS_MT_TRACKING_ID:
+                            if ev.value != -1:
+                                new_touch = cur_slot
+                        elif ev.code == e.ABS_MT_POSITION_X:
+                            sx[cur_slot] = ev.value
+                        elif ev.code == e.ABS_MT_POSITION_Y:
+                            sy[cur_slot] = ev.value
+                    elif ev.type == e.EV_SYN and new_touch is not None:
+                        s = new_touch
+                        new_touch = None
+                        if s in sx and s in sy:
+                            out, redraw = tap_to_bytes(sx[s], sy[s])
+                            if out:
+                                os.write(fd, out)
+                            if redraw:
+                                render_kbd()
+                                hit_until = time.time() + 0.12
+            except Exception:
+                pass
+
+        now = time.time()
+        if hit_until and now > hit_until:
+            hit_until = 0.0
+            hit_key = None
+            render_kbd()
+        if now - last_term > 0.1:
+            render_term()
+            last_term = now
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

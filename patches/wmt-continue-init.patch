@@ -1,0 +1,46 @@
+diff -ur a/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/common_drv_init.c b/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/common_drv_init.c
+--- a/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/common_drv_init.c	2026-08-04 15:51:41.000652903 +0000
++++ b/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/common_drv_init.c	2026-08-04 15:51:41.000652903 +0000
+@@ -34,22 +34,22 @@
+ 	/* HIF-SDIO driver init */
+ 	i_ret_tmp = mtk_wcn_hif_sdio_drv_init();
+ 	i_ret += i_ret_tmp;
+-	WMT_DETECT_PR_DBG("HIF-SDIO driver init, i_ret:%d\n", i_ret);
++	WMT_DETECT_PR_INFO("pmOS: HIF-SDIO init ret:%d\n", i_ret_tmp);
+ 
+ 	/* WMT driver init */
+ 	i_ret_tmp = mtk_wcn_common_drv_init();
+ 	i_ret += i_ret_tmp;
+-	WMT_DETECT_PR_DBG("COMBO COMMON driver init, i_ret:%d\n", i_ret);
++	WMT_DETECT_PR_INFO("pmOS: COMBO COMMON init ret:%d\n", i_ret_tmp);
+ 
+ 	/* STP-UART driver init */
+ 	i_ret_tmp = mtk_wcn_stp_uart_drv_init();
+ 	i_ret += i_ret_tmp;
+-	WMT_DETECT_PR_DBG("STP-UART driver init, i_ret:%d\n", i_ret);
++	WMT_DETECT_PR_INFO("pmOS: STP-UART init ret:%d\n", i_ret_tmp);
+ 
+ 	/* STP-SDIO driver init */
+ 	i_ret_tmp = mtk_wcn_stp_sdio_drv_init();
+ 	i_ret += i_ret_tmp;
+-	WMT_DETECT_PR_DBG("STP-SDIO driver init, i_ret:%d\n", i_ret);
++	WMT_DETECT_PR_INFO("pmOS: STP-SDIO init ret:%d\n", i_ret_tmp);
+ 
+ 	WMT_DETECT_PR_INFO("common driver init finish:%d\n", i_ret);
+ 	return i_ret;
+diff -ur a/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/conn_drv_init.c b/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/conn_drv_init.c
+--- a/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/conn_drv_init.c	2026-08-04 15:51:41.000652903 +0000
++++ b/drivers/misc/mediatek/connectivity/common/common_detect/drv_init/conn_drv_init.c	2026-08-04 15:51:41.001652918 +0000
+@@ -40,8 +40,10 @@
+ 	tmp_ret = do_common_drv_init(chip_id);
+ 	i_ret += tmp_ret;
+ 	if (tmp_ret) {
+-		WMT_DETECT_PR_ERR("do common driver not ready, ret:%d\n abort!\n", tmp_ret);
+-		return i_ret;
++		/* pmOS: khong bo cuoc. WiFi cua MT6768 di qua AXI, con STP-UART va
++		 * STP-SDIO la duong cu; chung bao ban cung khong can tro wlan.
++		 */
++		WMT_DETECT_PR_ERR("do common driver ret:%d, van tiep tuc\n", tmp_ret);
+ 	}
+ 
+ 	tmp_ret = do_bluetooth_drv_init(chip_id);

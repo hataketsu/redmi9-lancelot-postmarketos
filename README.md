@@ -152,6 +152,175 @@ legible on a 1080x2340 panel — the default 8x16 font is pinhead-sized.
 
 Result: the Tux boot logos render (one per CPU core) and the login prompt is usable.
 
+### 6. No touchscreen — wrong driver variant, then missing firmware
+
+`/proc/bus/input/devices` listed no touch device at all. Two separate causes.
+
+**a. merlin's config selects a different driver for the same chip.** Both devices use
+a Novatek NT36672, but the kernel tree carries two independent forks of that driver:
+
+```
+merlin  : CONFIG_TOUCHSCREEN_NT36xxx_HOSTDL_SPI=y   CONFIG_TOUCHSCREEN_FTS=y
+lancelot: CONFIG_TOUCHSCREEN_MTK_NT36672=y          CONFIG_TOUCHSCREEN_MTK_FT8719P=y
+```
+
+They cannot coexist — the forks share global symbol names (`ts`, `nvt_gesture_flag`,
+`ENG_RST_ADDR`, `fts_gesture_flag`), so enabling both fails at link with
+`multiple definition`. Enable lancelot's pair and disable merlin's.
+
+Related trap: the *display* driver depends on the *touch* driver.
+`drivers/misc/mediatek/video/mt6768/videox/disp_recovery.c:708` declares
+`extern int32_t nvt_update_firmware(...)` with **no `#ifdef`** and calls it
+unconditionally, so disabling every touch driver breaks the vmlinux link.
+
+**b. The NT36672 is a "no flash" part** — firmware is downloaded to it on every boot,
+and postmarketOS has none:
+
+```
+[NVT-ts] update_firmware_request 314: filename is nvt_tm_fw.bin
+NVT-ts spi0.0: Direct firmware load for nvt_tm_fw.bin failed with error -2
+```
+
+Extract it from the LineageOS vendor image. The OTA zip ships `vendor.new.dat.br`,
+not a mountable image:
+
+```sh
+brotli -d vendor.new.dat.br -o vendor.new.dat
+python3 sdat2img.py vendor.transfer.list vendor.new.dat vendor.img
+debugfs -R "dump /firmware/nvt_tm_fw.bin nvt_tm_fw.bin" vendor.img
+```
+
+Pick the file matching the panel LK selected — `LCM_name=...tianma...` means
+`nvt_tm_fw.bin`. Drop it in `/lib/firmware/`. Result:
+
+```
+[NVT-ts] nvt_update_firmware 1124: Update firmware success! <111378 us>
+/proc/nvt_tp_info -> [Vendor]Tianma,[TP-IC]:NT36672,[FW]0x14
+```
+
+Ten-finger multitouch, protocol B, works.
+
+### 7. No `wlan0` — MediaTek's connectivity stack is driven from userspace
+
+The kernel config was already right (`CONFIG_MTK_COMBO_WIFI=y`,
+`CONFIG_WLAN_DRV_BUILD_IN=y`, `CONFIG_MTK_COMBO_CHIP_CONSYS_6768`) and the `gen4m`
+driver was built in, but nothing appeared — not even a log line. MediaTek's stack
+needs two vendor daemons that postmarketOS does not have, and cannot run: they are
+bionic binaries and this is a musl system. Both were reimplemented against the kernel
+source. Three separate blockers, in the order they appear:
+
+**a. The driver init aborts on an unrelated failure, once per boot.**
+`do_common_drv_init()` returns the **sum** of four sub-inits, and `HIF-SDIO` always
+returns `-16` here — this chip talks over AXI, not SDIO. `do_connectivity_driver_init()`
+sees non-zero and returns immediately, so `do_wlan_drv_init()` never runs. Worse, it
+guards itself with `static int init_before`, so it runs **exactly once per boot** — once
+it has failed, further ioctls return 0 and do nothing.
+
+[`patches/wmt-continue-init.patch`](patches/wmt-continue-init.patch) drops the early
+return and promotes four `PR_DBG` lines to `PR_INFO` so the failing sub-init is visible.
+After it:
+
+```
+pmOS: HIF-SDIO init ret:-16
+pmOS: COMBO COMMON init ret:0 / STP-UART ret:0 / STP-SDIO ret:0
+do_wlan_drv_init: WLAN-GEN4 driver init, ret:0
+```
+
+and `/dev/wmtWifi` appears.
+
+**b. `WMT_IOCTL_SET_STP_MODE` is mandatory and fails silently if skipped.**
+
+```
+[WMT-CORE][E]wmt_core_stp_init(796): no hif info!
+```
+
+`wmt_lib_set_hif()` decodes the argument as bits `[3:0]` = STP interface, `[7:4]` = FM
+mode. MT6768 runs STP over BTIF: `STP_BTIF_FULL(0x03) | (WMT_FM_COMM(2) << 4)` = `0x23`.
+
+**c. The kernel asks *userspace* to locate the firmware.** On power-on it writes a
+command string to `/dev/stpwmt` and blocks for six seconds:
+
+```
+read("/dev/stpwmt")  -> "srh_rom_patch" | "srh_patch"
+                        ioctl SET_ROM_PATCH_INFO / SET_PATCH_NUM + SET_PATCH_INFO
+write("ok")
+```
+
+With nobody listening: `wmt_ctrl_ul_cmd(468): wait signal timeout`.
+
+Two traps in picking the firmware, both of which fail *after* a successful-looking
+copy into EMI:
+
+- **Wrong chip family.** `/vendor/firmware` ships both `soc1_0_*` and `soc3_0_*`. This
+  chip is `soc1_0` (matching `WIFI_RAM_CODE_soc1_0_1a_1.bin`); `soc3_0_ram_mcu_*` carries
+  `HwVer=0x8a10` while the chip reports `0x8a00`.
+- **The low address byte.** The header is `struct wmt_rom_patch` — `u4PatchAddr` at
+  offset 24, `u4PatchType` at 28 (stored big-endian; read the last byte). Every patch
+  file has `0x11` as the low byte of the address and it must be cleared:
+
+  ```
+  patch_mcu 0x0001c011 -> 0x0001c000     ram_mcu  0xf0000011 -> 0xf0000000
+  ram_bt    0xf0080011 -> 0xf0080000     ram_wifi 0xf0140011 -> 0xf0140000
+  ```
+
+  Leave it in and the chip loads the patch, then stops answering:
+
+  ```
+  wmt_core_init_script_retry(713): read (wmt reset) iRet(-1) evt len err(rx:0, exp:5)
+  mtk_wcn_soc_sw_init(1300): init_table_3 fail(-1)
+  ```
+
+  The kernel takes the low 24 bits as an EMI offset
+  (`patchEmiOffset = a[2] << 16 | a[1] << 8 | a[0]`), which yields MediaTek's standard
+  layout: mcu `0x000000`, bt `0x080000`, wifi `0x140000`.
+
+Order matters, and the kernel caches the patch table for the whole boot
+(`if (!pDev->pWmtRomPatchInfo[WMTDRV_TYPE_WMT])`) — **registering the wrong file means
+rebooting**, fixing userspace and retrying will not help.
+
+```sh
+wmt_loader.py             # ioctls on /dev/wmtdetect -> /dev/wmtWifi
+wmt_launcher.py &         # SET_STP_MODE, then serve srh_rom_patch / srh_patch
+echo 1 > /dev/wmtWifi     # -> wlan0
+wpa_supplicant ...
+```
+
+All of it is wrapped in [`scripts/wifi-up.sh`](scripts/wifi-up.sh).
+
+The MAC address is random (`5a:ca:…`, locally administered) because the NVRAM partition
+is not read. It does not stop anything from working.
+
+---
+
+## Flashing without fastboot
+
+Once postmarketOS boots, `fastboot` is no longer needed to iterate on the kernel.
+`recovery` is `/dev/mmcblk0p1` and the default user is in `wheel`, so a new boot
+image can be written from the running system:
+
+```sh
+scp boot.img phone:/tmp/ && ssh phone "sudo dd if=/tmp/boot.img of=/dev/mmcblk0p1"
+```
+
+[`scripts/flash-over-ssh.sh`](scripts/flash-over-ssh.sh) does this with the checks
+that matter: the `ANDROID!` magic, the `AVBf` footer (missing it means `lk_crash`),
+an md5 after the copy, and **an md5 of the data read back off the eMMC** — this eMMC
+has `life_time 0x0b` (past its rated life), so silent write corruption is a real risk.
+fastboot remains the recovery path if a flash goes bad.
+
+**Choosing what to boot.** A plain `reboot` makes LK load `boot`, which is LineageOS;
+postmarketOS lives in `recovery`. Write the bootloader control block to `misc`
+(`/dev/mmcblk0p2`) and LK loads recovery instead:
+
+```sh
+printf '%-32s' boot-recovery | tr ' ' '\0' | dd of=/dev/mmcblk0p2 conv=notrunc
+```
+
+See [`scripts/reboot-to.sh`](scripts/reboot-to.sh).
+
+Note that busybox `reboot` on this OpenRC image **powers the phone off** rather than
+restarting it. Use `sync; echo b > /proc/sysrq-trigger`.
+
 ---
 
 ## Traps worth knowing

@@ -819,3 +819,180 @@ Dau hieu nhan biet: build xong trong 2 phut = khong build; build that mat ~6 phu
 Tim chuoi `name_to_handle_at` trong anh kernel giai nen **luon tra 0** du co hay khong, vi
 kallsyms luu ten symbol o dang nen theo token. Khong dung cach nay de xac nhan config.
 Dung: so sanh sha256 cua kernel truoc/sau, hoac boot thu.
+
+## 18. Cảm ứng: driver sai biến thể, thiếu firmware
+
+### 18.1 Driver sai biến thể (bẫy giống hệt CONFIG_CUSTOM_KERNEL_LCM)
+
+`/proc/bus/input/devices` không có thiết bị cảm ứng nào. Nguyên nhân: config merlin
+bật biến thể SPI, còn lancelot dùng biến thể MTK:
+
+```
+merlin  : CONFIG_TOUCHSCREEN_NT36xxx_HOSTDL_SPI=y   CONFIG_TOUCHSCREEN_FTS=y
+lancelot: CONFIG_TOUCHSCREEN_MTK_NT36672=y          CONFIG_TOUCHSCREEN_MTK_FT8719P=y
+```
+
+Cùng chip NT36672 nhưng hai cây driver riêng, **trùng tên biến toàn cục**
+(`ts`, `nvt_gesture_flag`, `fts_gesture_flag`, `ENG_RST_ADDR`...), nên bật cả hai
+thì `multiple definition` lúc link. Phải bật đúng một tổ hợp.
+
+Thêm một bẫy nữa: `drivers/misc/mediatek/video/mt6768/videox/disp_recovery.c:708`
+khai báo `extern int32_t nvt_update_firmware(...)` **không có ifdef** và gọi thẳng,
+nên tắt hết driver cảm ứng thì link hỏng vì thiếu symbol. Driver màn hình phụ thuộc
+driver cảm ứng.
+
+Lỗi tự gây: dùng `grep -q "CONFIG_X"` để kiểm tra đã bật chưa — nó khớp cả dòng
+`# CONFIG_X is not set`, nên nhánh thêm cấu hình bị bỏ qua và build đầu tiên chạy
+với **không driver nào**. Phải neo `^CONFIG_X=y`.
+
+### 18.2 Thiếu firmware
+
+Sau khi driver probe được, `NVTCapacitiveTouchScreen` xuất hiện trên `event2` nhưng:
+
+```
+[NVT-ts] update_firmware_request 314: filename is nvt_tm_fw.bin
+NVT-ts spi0.0: Direct firmware load for nvt_tm_fw.bin failed with error -2
+```
+
+NT36672 là loại "no flash" — nạp firmware từ host mỗi lần boot. Lấy từ ROM Lineage:
+`vendor.new.dat.br` (brotli) -> `vendor.new.dat` -> `sdat2img` -> `vendor.img`
+-> `debugfs -R "dump /firmware/nvt_tm_fw.bin ..."`. Chép vào `/lib/firmware/`.
+
+Chọn đúng tên theo panel: `LCM_name=...tianma...` -> `nvt_tm_fw.bin`.
+
+Kết quả: `[Vendor]Tianma,[TP-IC]:NT36672,[FW]0x14`, `Update firmware success!`.
+
+### 18.3 Còn treo: có IRQ, không có event
+
+Chạm màn hình làm IRQ 26 (`mt-eint NVT-ts`) tăng hàng nghìn lần, nhưng `/dev/input/event2`
+ra **0 byte**. Đã loại trừ bằng đọc mã `nvt_ts_work_func`:
+
+- `bTouchIsAwake == 1` (dmesg in "Touch is already resume", nhánh gesture-only không chạy)
+- `nvt_check_palm` và `nvt_ts_point_data_checksum` đều in log khi hỏng — dmesg im
+- `abs_x_max/abs_y_max` = 1080/2340, đúng panel
+- `max_touch_num` = `TOUCH_MAX_FINGER_NUM` = 10, cứng trong mã, không lấy từ DT
+
+Nếu mọi điểm bị `continue` thì `finger_cnt = 0` và `input_sync` không có gì thay đổi
+-> input core nuốt luôn -> đúng 0 byte. Đang vá `nvt-debug-dump.patch` để in
+`point_data[]` thô và `finger_cnt`.
+
+## 19. Bỏ được fastboot và chọn hệ khi khởi động
+
+### 19.1 Nạp kernel qua SSH
+
+`recovery` = `/dev/mmcblk0p1`, user thuộc nhóm `wheel`. Nạp thẳng từ pmOS đang chạy:
+
+```
+scp boot.img -> /tmp -> sudo dd of=/dev/mmcblk0p1 -> reboot
+```
+
+`pmos/flash-over-ssh.sh`. Kiểm magic `ANDROID!`, kiểm footer `AVBf`, so md5 sau khi
+chép, và **đọc lại từ eMMC so md5 lần nữa** — eMMC đã mòn (`life_time 0x0b`) nên ghi
+hỏng âm thầm là có thật. Fastboot vẫn là đường cứu khi nạp hỏng.
+
+### 19.2 Chọn hệ bằng BCB
+
+`reboot` thường -> LK nạp `boot` -> LineageOS. pmOS nằm ở `recovery`. Ghi
+`command[] = "boot-recovery"` vào đầu phân vùng `misc` (`/dev/mmcblk0p2`) thì LK nạp
+recovery. `pmos/reboot-to.sh pmos|lineage [--now]`. Đã nghiệm thu.
+
+Lưu ý: `reboot` của busybox trên bản OpenRC này **tắt hẳn máy** chứ không khởi động
+lại. Dùng `sysrq b` sau khi `sync`.
+
+## 20. WiFi: dựng lại hai tiến trình userspace của MediaTek
+
+Kết quả: `wlan0` lên, nối được WPA2, có IP và ra Internet.
+
+### 20.1 Vì sao không có `wlan0`
+
+Config đã đúng sẵn (`CONFIG_MTK_COMBO_WIFI=y`, `CONFIG_WLAN_DRV_BUILD_IN=y`,
+`CONFIG_MTK_COMBO_CHIP_CONSYS_6768`), driver `gen4m` có trong kernel. Nhưng ngăn xếp
+connectivity của MTK **do userspace lái**, mà pmOS không có các binary vendor
+(`wmt_loader`, `wmt_launcher` — đều là bionic, không chạy trên musl).
+
+Ba mảnh phải viết lại, thứ tự bắt buộc:
+
+**a. `wmt_loader.py` — nạp driver chip.** ioctl lên `/dev/wmtdetect`
+(`WMT_DETECT_IOC_MAGIC = 'w'`):
+
+```
+GET_SOC_CHIP_ID -> 0x6768   SET_CHIP_ID   DO_MODULE_INIT
+```
+
+Sau đó `/dev/stpwmt`, `/dev/wmtWifi`, `/dev/stpbt` xuất hiện.
+
+Chặn đầu tiên: `do_common_drv_init` trả **tổng** bốn lần init con, mà `HIF-SDIO`
+luôn trả `-16` (chip này đi AXI chứ không SDIO). `do_connectivity_driver_init` thấy
+khác 0 là `return` ngay nên `do_wlan_drv_init` không bao giờ chạy. Tệ hơn, hàm đó có
+`static int init_before` — **chỉ chạy một lần mỗi lần boot**, hỏng là hết cơ hội, gọi
+lại ioctl chỉ trả 0 mà không làm gì. Phải sửa trong kernel: `wmt-continue-init.patch`
+bỏ `return` sớm và đổi bốn dòng `PR_DBG` thành `PR_INFO` để thấy bước nào hỏng.
+
+**b. `WMT_IOCTL_SET_STP_MODE` — thiếu là hỏng câm.** Không gọi thì:
+
+```
+[WMT-CORE][E]wmt_core_stp_init(796): no hif info!
+```
+
+`wmt_lib_set_hif()` giải mã tham số: bit[3:0] kiểu giao diện STP, bit[7:4] chế độ FM.
+MT6768 chạy STP trên BTIF: `STP_BTIF_FULL(0x03) | (WMT_FM_COMM(2) << 4) = 0x23`.
+
+**c. `wmt_launcher.py` — trả lời lệnh kernel gửi ngược lên.** Khi bật nguồn chip,
+kernel đặt chuỗi lệnh vào `/dev/stpwmt` rồi chờ 6 giây:
+
+```
+read("/dev/stpwmt")  -> "srh_rom_patch" hoac "srh_patch"
+   ioctl SET_ROM_PATCH_INFO / SET_PATCH_NUM + SET_PATCH_INFO
+write("ok")
+```
+
+Không ai trả lời thì `wmt_ctrl_ul_cmd(468): wait signal timeout`.
+
+### 20.2 Firmware: lấy từ vendor và chọn cho đúng
+
+Moi từ `vendor.img` (xem mục 18.2). Hai cái bẫy khi chọn file:
+
+**Nhầm họ chip.** Thư mục chứa cả `soc1_0_*` và `soc3_0_*`. Chip này là `soc1_0`
+(khớp `WIFI_RAM_CODE_soc1_0_1a_1.bin`); `soc3_0_ram_mcu_*` có `HwVer=0x8a10` trong khi
+chip báo `0x8a00`. Nạp nhầm thì kernel vẫn chép vào EMI bình thường nhưng chip không chạy.
+
+**Địa chỉ nạp.** Header là `struct wmt_rom_patch`: `u4PatchAddr` ở offset 24,
+`u4PatchType` ở offset 28 (lưu big-endian, đọc byte cuối là ra loại).
+Cả bốn file đều có byte thấp `0x11`; phải bỏ đi:
+
+```
+patch_mcu 0x0001c011 -> 0x0001c000     ram_mcu  0xf0000011 -> 0xf0000000
+ram_bt    0xf0080011 -> 0xf0080000     ram_wifi 0xf0140011 -> 0xf0140000
+```
+
+Giữ nguyên `0x11` thì patch nạp xong chip treo, không trả lời `wmt reset`:
+
+```
+wmt_core_init_script_retry(713): read (wmt reset) iRet(-1) evt len err(rx:0, exp:5)
+mtk_wcn_soc_sw_init(1300): init_table_3 fail(-1)
+```
+
+Kernel lấy 24 bit thấp làm offset trong EMI:
+`patchEmiOffset = a[2] << 16 | a[1] << 8 | a[0]` — ra đúng bố cục chuẩn
+mcu `0x000000`, bt `0x080000`, wifi `0x140000`.
+
+### 20.3 Thứ tự chạy
+
+```
+wmt_loader.py            -> tao /dev/wmtWifi
+wmt_launcher.py (nen)    -> SET_STP_MODE roi phuc vu srh_rom_patch / srh_patch
+echo 1 > /dev/wmtWifi    -> wlan0
+wpa_supplicant + dhcp
+```
+
+Bảng patch trong kernel chỉ nạp một lần mỗi lần boot
+(`if (!pDev->pWmtRomPatchInfo[WMTDRV_TYPE_WMT])`), nên **đăng ký nhầm file là phải reboot**,
+sửa userspace rồi chạy lại cũng vô ích.
+
+Gói sẵn trong `wifi-up.sh`, tự chạy lúc khởi động qua `/etc/local.d/wifi.start`
+(đọc SSID/mật khẩu từ `/etc/wifi.conf`, chmod 600, không đưa lên git).
+
+### 20.4 Còn lại
+
+MAC là ngẫu nhiên (`5a:ca:...`, locally administered) vì chưa đọc từ phân vùng `nvram`.
+Không cản trở sử dụng.
