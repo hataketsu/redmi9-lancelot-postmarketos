@@ -1163,3 +1163,175 @@ Tự phục hồi sau ~50 giây, không cần chạm vào máy. Đã chạy 6 v�
 Điều kiện tiên quyết mà tôi đã bỏ qua lần đầu: **kiểm chứng đường cứu ngoài luồng
 trước khi nạp** — đúng bài học "chạy phép thử đối chứng trước" đã ghi ở mục trên
 sau vụ `fastboot boot`.
+
+## 23. Debian 13 trên Linux 6.18 mainline — chạy được, có giao diện
+
+Kết quả trong ngày: Xiaomi Redmi 9 chạy **Debian 13 (trixie)** trên **Linux 6.18
+mainline**, có Phosh, cảm ứng chạy, SSH qua cổng USB. Không còn nhân 4.14 của hãng.
+
+```
+Linux lancelot 6.18.0 aarch64 GNU/Linux
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+root: PARTUUID=1ace1007-02 (the microSD)
+touch: novatek-nvt-ts-spi tren spi0.0 -> event1
+```
+
+### 23.1 Một nguyên nhân giải thích tất cả: LK giải nén gzip kernel
+
+Mọi `lk_crash` từ đầu dự án tới giờ — kể cả những lần nạp mainline khiến tôi kết luận
+sai rằng "LK không đọc nổi DTB mainline" — đều chung một nguyên nhân. So phần đầu
+kernel của một ảnh boot chắc chắn chạy được với ảnh của mình:
+
+```
+kernel chay duoc : code0 = 0x00088b1f   ->  1f 8b 08 00 = magic gzip
+u-boot.bin       : magic = "ARM\x64"    ->  ARM64 Image tho
+```
+
+**LK giải nén kernel trước khi nhảy vào.** Đưa cho nó thứ không phải gzip thì bộ giải
+nén của nó chết trước khi một lệnh nào của mình kịp chạy. DTB chưa bao giờ dính dáng:
+nén payload lại là LK nạp DTB mainline bình thường. Kết luận cũ trong README đã được
+đánh dấu là bị bác bỏ, kèm chính bằng chứng này.
+
+### 23.2 U-Boot: chết ở lúc bật MMU
+
+Sau khi qua được LK, U-Boot dừng ngay sau dòng `DRAM:` và không tới mốc đặt trong
+`board_init()`. Trong `init_sequence_r`, `initr_caches` chạy trước `board_init()`, nên
+thủ phạm là `dcache_enable()` — hàm này **không trả về** trên SoC này. Cho
+`enable_caches()` return sớm là U-Boot chạy tiếp tới dấu nhắc. Không dùng
+`CONFIG_SYS_DCACHE_OFF` vì config đó loại `cache_v8.c` khỏi build và làm link hỏng vì
+thiếu hàng loạt hàm cache.
+
+Hai lỗi phụ trong lúc gỡ:
+
+- DRAM sai: `get_ram_size()` dò tới 8 GB, đụng vùng bảo mật và báo 4 GiB, U-Boot
+  relocate ra ngoài RAM vật lý rồi treo. Lấy kích thước từ device tree thay vì dò.
+- DTB có **hai** node memory: `skeleton64.dtsi` của U-Boot đã khai sẵn `/memory` rỗng,
+  node của mình tên `memory@40000000` nên thành node thứ hai, mà
+  `fdtdec_setup_mem_size_base()` tra đúng đường dẫn `/memory` nên đọc phải node rỗng.
+  Đổi tên thành `memory` cho gộp làm một.
+
+### 23.3 Kênh log khi máy không có UART
+
+Trỏ ramoops vào **đúng địa chỉ vùng console mà nhân downstream đang dùng**:
+`0x4d05f000`. Tìm ra bằng cách quét `/dev/mem` tìm chữ ký `DBGC`
+(`PERSISTENT_RAM_SIG`). Định dạng `persistent_ram_buffer` giống hệt nhau, nên sau khi
+treo thì log hiện luôn ở `/sys/fs/pstore/console-ramoops` ở lần boot kế tiếp của **bất
+kỳ** nhân nào trên máy, đọc qua adb. Gần như mọi lỗi dưới đây đều chẩn đoán qua kênh
+này, phần lớn không phải chạm vào máy.
+
+**Đừng dùng đuôi vùng đặt trước cho framebuffer làm hộp thư.** Nhìn thì trống —
+`mblock-11-framebuffer` 36 MB trong khi `/dev/fb0` chỉ ánh xạ 30,9 MB — nhưng đọc
+`0x7fcb0000` trên máy đang chạy ra `0xf800f800`: dữ liệu điểm ảnh. LK vẽ logo lên đó,
+tức là nó sẽ xoá log đúng ở lần reset sau khi treo.
+
+### 23.4 Nạp nhân mainline mà không cần driver lưu trữ nào
+
+U-Boot không mở được khe thẻ (`Bad device specification mmc 1` — node `&mmc1` trong DTS
+của U-Boot không có pinctrl). Đi vòng: LK đã nạp sẵn phần **ramdisk** của ảnh boot vào
+RAM trước khi bàn giao, nên nhét thẳng kernel vào ô ramdisk.
+
+```
+[0]           Image
+[0x2400000]   dtb
+bootcmd: cp.b 0x4a080000 0x60000000 0x10000; booti 0x47c80000 - 0x60000000
+```
+
+`pack-uboot-payload.py` dựng ảnh này. Lệnh `cp.b` là bắt buộc: `booti` dời Image về
+`0x47e00000`, vùng đích nuốt luôn dtb, và báo
+`ERROR: Did not find a cmdline Flattened Device Tree`. Phải chép dtb lên chỗ cao trước.
+
+### 23.5 Bốn rào cản phía nhân, theo thứ tự gặp
+
+**`clk: Disabling unused clocks` rồi im.** Nhân tắt những clock LK để lại đang chạy cho
+panel — cũng chính là lý do màn hình đầy nhiễu xanh. Thêm
+`clk_ignore_unused pd_ignore_unused`.
+
+**`VFS: Unable to mount root fs on mmcblk1p2`, lần sau lại `mmcblk0p2`.** Hai controller
+probe bất đồng bộ nên thẻ SD lúc là `mmcblk0`, lúc là `mmcblk1`. Dùng
+`root=PARTUUID=...`. Phải đặt chữ ký đĩa MBR thật (ở đây `0x1ace1007`) trước, vì với
+chữ ký toàn số 0 mặc định thì util-linux không báo PARTUUID nào cả.
+
+**`SIGSEGV` ngẫu nhiên ở các tiến trình không liên quan** — `systemd-udevd`
+(`audit type=1701 sig=11`), `free`, `apt`, journal hỏng. DTS mainline khai bộ nhớ tới
+`0x7e605000` nhưng chỉ giữ chỗ cho ramoops, trong khi firmware vẫn đang giữ nhiều vùng
+nằm trong khoảng đó. Phải khai giữ chỗ:
+
+```
+atf@4ce00000       0x00060000
+mtk-ram-console    0x4d000000 + 0x5f000
+mtk-pstore-tail    0x4d09f000 + 0x61000
+tee@70000000       0x04200000              <- 66 MB, cai quan trong nhat
+lk-framebuffer     0x7dcb0000 + 0x02250000
+```
+
+Bản đồ này lấy từ `/proc/device-tree/reserved-memory` của nhân downstream.
+
+**`CONFIG_USB_ETH=y`.** Gadget `g_ether` kiểu cũ được dựng thẳng vào nhân trong
+`mt6768_defconfig` và chiếm UDC ngay lúc nhân khởi tạo, trước khi có userspace. Nên mọi
+script configfs đều hỏng với `Resource busy`, gadget luôn là `0525:a4a2` chứ không phải
+bản composite mình khai, và `/dev/ttyGS0` không bao giờ hiện. Tắt đi thì ECM + ACM lên
+cùng lúc thành `1d6b:0104`.
+
+Hệ quả cần nhớ: **"gadget USB lên" KHÔNG chứng minh userspace đã chạy.** Với `g_ether`
+dựng sẵn trong nhân thì một mình nhân đã dựng được gadget.
+
+### 23.6 Cảm ứng: mainline đã hỗ trợ sẵn
+
+Mainline có sẵn cả driver lẫn node device tree:
+
+```
+drivers/input/touchscreen/novatek-nvt-ts-spi.c   compatible = "novatek,nt36672a-ts"
+mt6769t-xiaomi-lancelot-tianma.dtsi:30           touchscreen@0 { ... }
+```
+
+Thiếu đúng hai thứ. Driver để mặc định `=m` nên phải hoặc dựng thẳng vào nhân, hoặc
+thật sự chạy `make modules` — build mỗi `Image dtbs` thì không có `.ko` nào cả. Và
+NT36672 là loại "no flash", cần nạp firmware mỗi lần khởi động:
+
+```
+Direct firmware load for ts.bin failed with error -2
+error -ENOENT: failed to upload firmware
+```
+
+Dùng lại `nvt_tm_fw.bin` đã moi từ vendor, đặt vào `/lib/firmware/ts.bin`. Sau đó driver
+bind được và có input device ở `event1`.
+
+### 23.7 Rootfs Debian: tải về, đừng debootstrap
+
+`debootstrap --foreign` chạy giai đoạn hai qua `qemu-aarch64-static`, dịch từng lệnh
+arm64 sang x86 trên **một** lõi: 85/179 gói cấu hình xong sau 1 giờ 07 phút, 15 lõi
+ngồi chơi. Ảnh cloud arm64 chính thức của Debian thì đã cấu hình sẵn:
+
+```sh
+curl -O https://cloud.debian.org/images/cloud/trixie/latest/debian-13-nocloud-arm64.tar.xz
+tar xf debian-13-nocloud-arm64.tar.xz     # ra disk.raw, khong phai cay thu muc
+losetup -fP disk.raw && mount /dev/loopXp1 /mnt
+```
+
+Cài `openssh-server` vào đó dưới qemu chỉ mất 1 phút 48 giây.
+
+Hai cái bẫy:
+
+- `/etc/resolv.conf` trong ảnh là symlink treo, nên `cp` không ghi xuyên qua được.
+- `systemd-firstboot` chặn boot ở `-- Press any key to proceed --`, mà máy không có bàn
+  phím. Phải mask service **và** ghi đè `/etc/machine-id` — file này chứa đúng chữ
+  `uninitialized`, chính là cờ kích hoạt firstboot, mà lệnh kiểm tra `[ -s ]` lại vui vẻ
+  coi là "đã có nội dung".
+
+Định dạng phân vùng rootfs trên thẻ phải bỏ bớt tính năng cho nhân Android 4.14 của hãng
+hiểu được: `-O ^64bit,^metadata_csum,^metadata_csum_seed,^orphan_file`. Không thì chỉ
+mount đọc được từ ROM gốc (`unsupported optional features (10000)`) — mà đó đúng là
+đường cứu cần dùng khi máy không boot.
+
+### 23.8 Sai lầm trong ngày (phần đáng ghi nhất)
+
+- **Gửi lệnh `reboot` từ console.** Máy rơi vào BROM, và từ đó LineageOS treo ở logo.
+  eMMC máy này vốn đã mòn (`life_time 0x0b`) nên đừng thêm chu kỳ ghi/reset nào không
+  cần thiết.
+- **Quên tháo bind mount `/proc /sys /dev`** trước khi `cp -a` rootfs, nên lệnh chép bò
+  vào chép cả bộ nhớ tiến trình.
+- **Nạp binary khi build đã hỏng từ trước**, rồi suýt rút kết luận từ chính phép thử vô
+  nghĩa đó. Xem kết quả build trước khi nạp.
+- **Đoán sai một lần rằng lỗi do `ld.so.cache` sinh dưới qemu**, trong khi nguyên nhân
+  thật là bản đồ bộ nhớ thiếu vùng giữ chỗ (mục 23.5).
+- **Coi "gadget USB lên" là bằng chứng userspace đã chạy** — sai, xem mục 23.5.
