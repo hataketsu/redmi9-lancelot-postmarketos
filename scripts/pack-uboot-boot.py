@@ -11,6 +11,9 @@ Hai cho de sai, ca hai deu lam LK chet cam:
 
   ./pack-uboot-boot.py <anh-mau.img> <u-boot.bin> <ket-qua.img>
 """
+import gzip
+import hashlib
+import io
 import struct
 import sys
 
@@ -56,11 +59,26 @@ def main(template, uboot, out):
     second = bytes(d[second_off:second_off + second_size])
     dtb = bytes(d[dtb_off:dtb_off + dtb_size])
 
-    new_kernel = open(uboot, "rb").read()
-    if new_kernel[56:60] != b"ARM\x64":
+    payload = open(uboot, "rb").read()
+    if payload[56:60] != b"ARM\x64":
         print("  canh bao: khong thay magic ARM64 o offset 56 cua u-boot.bin;"
               " can CONFIG_LINUX_KERNEL_IMAGE_HEADER=y")
-    print(f"u-boot      : {uboot}  {len(new_kernel)} B")
+    print(f"u-boot      : {uboot}  {len(payload)} B")
+
+    # LK cua may nay GIAI NEN kernel truoc khi nhay vao. Anh mau bat dau bang
+    # 1f 8b 08 -> gzip. Nhet mot ARM64 Image tho vao thi bo giai nen cua LK sap
+    # va may bao androidboot.bootreason=lk_crash, chua kip chay dong lenh nao.
+    kernel_orig = bytes(d[kernel_off:kernel_off + kernel_size])
+    if kernel_orig[:3] == b"\x1f\x8b\x08":
+        buf = io.BytesIO()
+        # mtime=0 cho ket qua lap lai duoc
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9, mtime=0) as g:
+            g.write(payload)
+        new_kernel = buf.getvalue()
+        print(f"  anh mau la kernel gzip -> nen u-boot lai: {len(new_kernel)} B")
+    else:
+        new_kernel = payload
+        print("  anh mau la kernel tho -> giu nguyen")
 
     head = bytearray(d[:hdr_pages])
     struct.pack_into("<I", head, 8, len(new_kernel))
@@ -73,6 +91,19 @@ def main(template, uboot, out):
         img += second + b"\0" * (roundup(len(second), page_size) - len(second))
     if dtb:
         img += dtb + b"\0" * (roundup(len(dtb), page_size) - len(dtb))
+
+    # Truong id la SHA1 chay qua tung phan kem do dai. Giu nguyen id cua anh mau
+    # thi no khong con khop noi dung moi.
+    sha = hashlib.sha1()
+    for part in (new_kernel, ramdisk, second):
+        sha.update(part)
+        sha.update(struct.pack("<I", len(part)))
+    if dtb:
+        sha.update(dtb)
+        sha.update(struct.pack("<I", len(dtb)))
+    digest = sha.digest()
+    img[576:576 + 32] = digest + b"\0" * (32 - len(digest))
+    print(f"  id (SHA1) tinh lai: {digest.hex()}")
 
     open(out, "wb").write(bytes(img))
     print(f"ket qua     : {out}  {len(img)} B")

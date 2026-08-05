@@ -1065,3 +1065,101 @@ phải bấm nút vào fastboot — đúng thứ cần tránh khi không có ng�
 
 Muốn tự phục hồi thì U-Boot phải ghi BCB rỗng **ngay khi vừa chạy**, việc này cần
 MMC đã init nên không thể đặt ở lệnh đầu tiên. Vẫn còn cửa sổ chết.
+
+## 22. U-Boot chạy được: gỡ ba lỗi, còn kẹt ở bật MMU
+
+### 22.1 `lk_crash` — LK giải nén kernel
+
+Nạp U-Boot lần đầu: `androidboot.bootreason=lk_crash`, không một dòng log. Có đủ
+footer AVB và ramdisk khác 0 rồi, nên nguyên nhân là thứ khác. So header ảnh mẫu:
+
+```
+pmOS kernel : code0 = 0x00088b1f   ->  1f 8b 08 00 = magic GZIP
+U-Boot      : magic = "ARM\x64"    ->  ARM64 Image tho
+```
+
+**LK của máy này giải nén kernel trước khi nhảy vào.** Đưa cho nó ảnh không phải
+gzip thì bộ giải nén sập ngay. Nén `u-boot.bin` bằng gzip là qua.
+
+Nhân tiện sửa luôn trường `id` (SHA1) trong header — trước đó giữ nguyên của ảnh
+mẫu nên không khớp nội dung mới.
+
+### 22.2 DRAM sai → relocate ra ngoài RAM
+
+Sau khi qua LK, log đầu tiên của U-Boot:
+
+```
+<debug_uart>
+[UBOOT] board_early_init_f reached
+U-Boot 2026.01-rc2 (Aug 05 2026 - 02:50:13 +0000)
+CPU:   MediaTek MT6768
+DRAM:  4 GiB (total 0 Bytes)
+```
+
+`dram_init()` dùng `get_ram_size(CFG_SYS_SDRAM_BASE, SZ_8G)` — dò RAM bằng cách
+ghi rồi đọc lại, quét tới 8 GB, đụng vùng bảo mật và trả về 4 GiB sai. U-Boot
+relocate lên `0x140000000`, ngoài RAM vật lý.
+
+Bỏ dò, lấy từ device tree. Nhưng vẫn ra `DRAM: 0 Bytes` vì hai lý do nối tiếp:
+
+1. `gd->ram_size = mt6768_mem_map[1].size` ghi đè — mục DDR đó **không khai báo
+   `.size`** nên bằng 0. Bản gốc dựa vào `get_ram_size` ghi đè ngay sau.
+2. DTB có **hai** node memory: `skeleton64.dtsi` của U-Boot khai sẵn
+   `/memory` với `reg = <0 0 0 0>`, còn node của tôi tên `memory@40000000` nên
+   thành node thứ hai. `fdtdec_setup_mem_size_base()` tra đúng đường dẫn
+   `/memory` nên đọc phải node rỗng. Đổi tên thành `memory` (không kèm địa chỉ)
+   để gộp làm một.
+
+Kết quả: `DRAM: 988.7 MiB` (0x3dcb0000 — vùng liền mạch từ 0x40000000 tới chỗ
+vùng đặt trước cho framebuffer).
+
+### 22.3 Còn kẹt: chết ngay sau dòng DRAM
+
+Log luôn dừng sau `DRAM:`, và **không** tới mốc đặt ở `board_init()`. Trong
+`init_sequence_r`, `initr_caches` (bật MMU) chạy trước `board_init()`, nên chỗ
+hỏng nằm trong relocate hoặc lúc bật MMU.
+
+Đã loại trừ:
+
+- **Đích relocate.** Hạ RAM xuống 256 MB (relocate rơi vào giữa vùng lành) —
+  vẫn chết y hệt.
+- **Console tắt sau relocate.** Thêm `bootph-all` cho node console và cắm mốc
+  độc lập với console (ghi thẳng ramoops) ở `board_init` — mốc không hiện, nên
+  không phải câm mà là chết thật.
+- **Vùng framebuffer chồng lấn.** `dram_init` lấy địa chỉ fb bằng
+  `fdtdec_get_addr()` — hàm cũ giả định địa chỉ một cell, trong khi DTS dùng
+  `#address-cells = <2>`, nên trả về 0 và `mem_map[2]` (12 MB) đè lên vùng thiết
+  bị `0..0x40000000` của `mem_map[0]`. Đã sửa sang
+  `fdtdec_get_addr_size_auto_noparent()`. **Vẫn chết y hệt** — nên đây là một lỗi
+  thật nhưng không phải nguyên nhân.
+
+Hướng tiếp: chạy thử với dcache tắt để xác nhận MMU là thủ phạm.
+`CONFIG_SYS_DCACHE_OFF=y` làm build sập (`Error 139`, SIGSEGV trong chuỗi build)
+nên chưa thử được — cần gỡ riêng.
+
+Lỗi tự gây: lần đó tôi nạp luôn mà không xem kết quả build, nên đã nạp lại đúng
+binary cũ và suýt kết luận sai từ một phép thử vô nghĩa.
+
+### 22.4 Vòng thử an toàn (quan trọng hơn cả kết quả)
+
+Đêm qua tôi nạp U-Boot đè lên `recovery` — chỗ chứa pmOS, đường SSH duy nhất —
+rồi đặt BCB `boot-recovery`. U-Boot treo, BCB không tự xoá, nên mọi lần reset lại
+vào U-Boot: mất cả hai đường lui trong một thao tác. Phải cứu bằng `mtkclient`
+qua BROM (giữ hai phím Volume rồi cắm cáp), xoá `misc` và nạp lại `recovery`.
+
+Vòng đúng, không đụng BCB lần nào:
+
+```
+BCB rong (mac dinh = LineageOS o phan vung boot)
+adb reboot bootloader
+fastboot flash recovery boot-uboot.img
+fastboot reboot recovery      <- lenh MOT LAN, LK nghe thang, khong ghi BCB
+U-Boot treo -> watchdog reset -> BCB van rong -> ve LineageOS
+adb shell cat /sys/fs/pstore/console-ramoops   -> log U-Boot
+```
+
+Tự phục hồi sau ~50 giây, không cần chạm vào máy. Đã chạy 6 vòng liên tiếp.
+
+Điều kiện tiên quyết mà tôi đã bỏ qua lần đầu: **kiểm chứng đường cứu ngoài luồng
+trước khi nạp** — đúng bài học "chạy phép thử đối chứng trước" đã ghi ở mục trên
+sau vụ `fastboot boot`.
