@@ -35,6 +35,14 @@ console      userspace framebuffer terminal + on-screen keyboard
 `fbcon` is *not* usable — see blocker 5c. The terminal on the panel is
 [`scripts/fbterm`](scripts/fbterm), which draws to `/dev/fb0` directly.
 
+> **Superseded for daily use.** This device now also runs **Debian 13 on
+> mainline Linux 6.18** with Phosh, through a U-Boot port loaded by lk — no
+> vendor 4.14 kernel involved. That work, including the U-Boot patch series, the
+> kernel patches and the 3 GiB memory-map handover, lives in
+> [**mt6768-mainline-notes**](https://github.com/hataketsu/mt6768-mainline-notes).
+> This repository stays as the record of the downstream route, which is still
+> the only one with working built-in WiFi.
+
 ---
 
 ## Blockers found, and how each was proven

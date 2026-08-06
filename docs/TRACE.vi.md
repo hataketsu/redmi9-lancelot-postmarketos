@@ -1,7 +1,7 @@
 # Redmi 9 (lancelot) — trace chẩn đoán
 
 Ngày: 2026-08-04. Máy: Xiaomi Redmi 9, codename `lancelot`, MediaTek Helio G80 (MT6768),
-non-A/B, bootloader unlock (`verifiedbootstate: orange`), serial `81d4ca960401`.
+non-A/B, bootloader unlock (`verifiedbootstate: orange`), serial da an di.
 
 ---
 
@@ -473,7 +473,7 @@ xiaomi-merlin-boot.img.gz               52 MB   ext2, label pmOS_boot  (512 MiB 
 xiaomi-merlin-root.img.gz              200 MB   ext4, label pmOS_root  (754 MiB bung ra)
 ```
 
-UI = `console`, service manager = systemd, mat khau user = `147147`.
+UI = `console`, service manager = systemd, mat khau user = dat luc `pmbootstrap init`.
 
 Tat ca o `pmos/`, checksum trong `pmos/SHA256SUMS`.
 

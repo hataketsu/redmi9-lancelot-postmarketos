@@ -99,6 +99,6 @@ Khong len duoc thi rut pin, bat lai -> LineageOS nguyen ven.
 
 Len duoc thi vao bang USB:
 
-       ssh user@172.16.42.1        # mat khau: 147147
+       ssh user@172.16.42.1        # mat khau: xem $PMOS_PASS
 
 NEXT

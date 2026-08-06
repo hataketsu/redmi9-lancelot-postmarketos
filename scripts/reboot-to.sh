@@ -11,7 +11,7 @@ set -euo pipefail
 
 HOST=172.16.42.1
 USER_=user
-PASS="${PMOS_PASS:-147147}"   # ghi de bang bien moi truong PMOS_PASS
+PASS="${PMOS_PASS:?dat bien moi truong PMOS_PASS = mat khau tren may}"
 MISC=/dev/disk/by-partlabel/misc
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }

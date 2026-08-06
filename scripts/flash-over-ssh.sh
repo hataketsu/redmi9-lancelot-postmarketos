@@ -8,7 +8,7 @@ set -euo pipefail
 
 HOST=172.16.42.1
 USER_=user
-PASS="${PMOS_PASS:-147147}"   # ghi de bang bien moi truong PMOS_PASS
+PASS="${PMOS_PASS:?dat bien moi truong PMOS_PASS = mat khau tren may}"
 PART=/dev/mmcblk0p1          # by-partlabel/recovery
 PART_SIZE=67108864
 
